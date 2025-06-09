@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -127,7 +128,7 @@ func New(server ...string) *Client {
 
 // NewFromSelector returns a new Client using the provided ServerSelector.
 func NewFromSelector(ss ServerSelector) *Client {
-	return &Client{selector: ss}
+	return &Client{selector: ss, freeconn: atomic.Pointer[map[string][]*conn]{}}
 }
 
 // Client is a memcache client.
@@ -155,8 +156,7 @@ type Client struct {
 
 	selector ServerSelector
 
-	mu       sync.Mutex
-	freeconn map[string][]*conn
+	freeconn atomic.Pointer[map[string][]*conn]
 }
 
 // Item is an item to be got or stored in a memcached server.
@@ -213,31 +213,34 @@ func (cn *conn) condRelease(err *error) {
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.freeconn == nil {
-		c.freeconn = make(map[string][]*conn)
+	freeConns := c.freeconn.Load()
+	if freeConns == nil {
+		c.freeconn.Store(&map[string][]*conn{})
 	}
-	freelist := c.freeconn[addr.String()]
+	connList := *c.freeconn.Load()
+	freelist := connList[addr.String()]
 	if len(freelist) >= c.maxIdleConns() {
 		cn.nc.Close()
 		return
 	}
-	c.freeconn[addr.String()] = append(freelist, cn)
+	connList[addr.String()] = append(freelist, cn)
+	c.freeconn.Store(&connList)
 }
 
 func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.freeconn == nil {
+	freeConns := c.freeconn.Load()
+	if freeConns == nil {
 		return nil, false
 	}
-	freelist, ok := c.freeconn[addr.String()]
+
+	connList := *c.freeconn.Load()
+	freelist, ok := connList[addr.String()]
 	if !ok || len(freelist) == 0 {
 		return nil, false
 	}
 	cn = freelist[len(freelist)-1]
-	c.freeconn[addr.String()] = freelist[:len(freelist)-1]
+	connList[addr.String()] = freelist[:len(freelist)-1]
+	c.freeconn.Store(&connList)
 	return cn, true
 }
 
@@ -834,16 +837,14 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 //
 // After Close, the Client may still be used.
 func (c *Client) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	var ret error
-	for _, conns := range c.freeconn {
+	for _, conns := range *c.freeconn.Load() {
 		for _, c := range conns {
 			if err := c.nc.Close(); err != nil && ret == nil {
 				ret = err
 			}
 		}
 	}
-	c.freeconn = nil
+	c.freeconn.Store(nil)
 	return ret
 }
